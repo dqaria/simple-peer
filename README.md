@@ -13,7 +13,7 @@
 [sauce-image]: https://saucelabs.com/buildstatus/simple-peer
 [sauce-url]: https://saucelabs.com/u/simple-peer
 
-#### Simple WebRTC video, voice, and data channels
+#### Simple WebRTC data channels for Node.js and browsers
 
 <h5 align="center">
   Sponsored by&nbsp;&nbsp;&nbsp;&nbsp;<a href="http://dfinity.org/"><img src="https://cdn.rawgit.com/feross/simple-peer/master/img/dfinity-sponsor.png" alt="DFINITY" width=250 valign="middle"></a>
@@ -27,16 +27,17 @@
 
 ## features
 
-- concise, **node.js style** API for [WebRTC](https://en.wikipedia.org/wiki/WebRTC)
+- concise, **node.js style** API for [WebRTC](https://en.wikipedia.org/wiki/WebRTC) data channels
 - **works in node and the browser!**
-- supports **video/voice streams**
-- supports **data channel**
+  - Node.js: uses [node-datachannel](https://github.com/murat-dogan/node-datachannel) (optional dependency)
+  - Browser: uses native WebRTC APIs
+- **data channel** support
   - text and binary data
   - node.js [duplex stream](http://nodejs.org/api/stream.html) interface
 - supports advanced options like:
   - enable/disable [trickle ICE candidates](http://webrtchacks.com/trickle-ice/)
   - manually set config options
-  - transceivers and renegotiation
+  - custom WebRTC implementation via `wrtc` option
 
 This package is used by [WebTorrent](https://webtorrent.io) and [many others](#who-is-using-simple-peer).
 
@@ -44,8 +45,6 @@ This package is used by [WebTorrent](https://webtorrent.io) and [many others](#w
 - [examples](#usage)
   * [A simpler example](#a-simpler-example)
   * [data channels](#data-channels)
-  * [video/voice](#videovoice)
-  * [dynamic video/voice](#dynamic-videovoice)
   * [in node](#in-node)
 - [api](#api)
 - [events](#events)
@@ -58,11 +57,19 @@ This package is used by [WebTorrent](https://webtorrent.io) and [many others](#w
 
 ## install
 
-```
+```bash
 npm install simple-peer
 ```
 
-This package works in the browser with [browserify](https://browserify.org). If
+**For Node.js**: To use WebRTC data channels in Node.js, you'll need to install [node-datachannel](https://github.com/murat-dogan/node-datachannel):
+
+```bash
+npm install node-datachannel
+```
+
+**Note**: `node-datachannel` requires compilation and may not work in all environments. If you encounter installation issues, you can use alternative WebRTC implementations via the `wrtc` option (see below).
+
+**For browsers**: This package works in the browser with [browserify](https://browserify.org). If
 you do not use a bundler, you can use the `simplepeer.min.js` standalone script
 directly in a `<script>` tag. This exports a `SimplePeer` constructor on
 `window`. Wherever you see `Peer` in the examples below, substitute that with
@@ -166,59 +173,15 @@ peer2.on('data', data => {
 })
 ```
 
-### video/voice
+### in node
 
-Video/voice is also super simple! In this example, peer1 sends video to peer2.
+This library automatically uses [node-datachannel](https://github.com/murat-dogan/node-datachannel) when running in Node.js (if installed):
 
 ```js
 var Peer = require('simple-peer')
 
-// get video/voice stream
-navigator.mediaDevices.getUserMedia({
-  video: true,
-  audio: true
-}).then(gotMedia).catch(() => {})
-
-function gotMedia (stream) {
-  var peer1 = new Peer({ initiator: true, stream: stream })
-  var peer2 = new Peer()
-
-  peer1.on('signal', data => {
-    peer2.signal(data)
-  })
-
-  peer2.on('signal', data => {
-    peer1.signal(data)
-  })
-
-  peer2.on('stream', stream => {
-    // got remote video stream, now let's show it in a video tag
-    var video = document.querySelector('video')
-
-    if ('srcObject' in video) {
-      video.srcObject = stream
-    } else {
-      video.src = window.URL.createObjectURL(stream) // for older browsers
-    }
-
-    video.play()
-  })
-}
-```
-
-For two-way video, simply pass a `stream` option into both `Peer` constructors. Simple!
-
-Please notice that `getUserMedia` only works in [pages loaded via **https**](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia#Encryption_based_security).
-
-### dynamic video/voice
-
-It is also possible to establish a data-only connection at first, and later add
-a video/voice stream, if desired.
-
-```js
-var Peer = require('simple-peer') // create peer without waiting for media
-
-var peer1 = new Peer({ initiator: true }) // you don't need streams here
+// node-datachannel is automatically detected and used
+var peer1 = new Peer({ initiator: true })
 var peer2 = new Peer()
 
 peer1.on('signal', data => {
@@ -229,33 +192,16 @@ peer2.on('signal', data => {
   peer1.signal(data)
 })
 
-peer2.on('stream', stream => {
-  // got remote video stream, now let's show it in a video tag
-  var video = document.querySelector('video')
-
-  if ('srcObject' in video) {
-    video.srcObject = stream
-  } else {
-    video.src = window.URL.createObjectURL(stream) // for older browsers
-  }
-
-  video.play()
+peer1.on('connect', () => {
+  peer1.send('hello from node!')
 })
 
-function addMedia (stream) {
-  peer1.addStream(stream) // <- add streams to peer dynamically
-}
-
-// then, anytime later...
-navigator.mediaDevices.getUserMedia({
-  video: true,
-  audio: true
-}).then(addMedia).catch(() => {})
+peer2.on('data', data => {
+  console.log('received: ' + data)
+})
 ```
 
-### in node
-
-To use this library in node, pass in `opts.wrtc` as a parameter (see [the constructor options](#peer--new-peeropts)):
+**Alternative WebRTC implementation**: If you want to use a different WebRTC implementation (like [wrtc](https://github.com/node-webrtc/node-webrtc)), pass in `opts.wrtc`:
 
 ```js
 var Peer = require('simple-peer')
@@ -271,7 +217,7 @@ var peer2 = new Peer({ wrtc: wrtc })
 
 Create a new WebRTC peer connection.
 
-A "data channel" for text/binary communication is always established, because it's cheap and often useful. For video/voice communication, pass the `stream` option.
+A "data channel" for text/binary communication is always established. This library focuses on data channel communication only.
 
 If `opts` is specified, then the default options (shown below) will be overridden.
 
@@ -284,8 +230,6 @@ If `opts` is specified, then the default options (shown below) will be overridde
   offerOptions: {},
   answerOptions: {},
   sdpTransform: function (sdp) { return sdp },
-  stream: false,
-  streams: [],
   trickle: true,
   allowHalfTrickle: false,
   wrtc: {}, // RTCPeerConnection/RTCSessionDescription/RTCIceCandidate
@@ -302,14 +246,11 @@ The options do the following:
 - `offerOptions` - custom offer options (used by [`createOffer`](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createOffer) method)
 - `answerOptions` - custom answer options (used by [`createAnswer`](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/createAnswer) method)
 - `sdpTransform` - function to transform the generated SDP signaling data (for advanced users)
-- `stream` - if video/voice is desired, pass stream returned from [`getUserMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)
-- `streams` - an array of MediaStreams returned from [`getUserMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)
 - `trickle` - set to `false` to disable [trickle ICE](http://webrtchacks.com/trickle-ice/) and get a single 'signal' event (slower)
-- `wrtc` - custom webrtc implementation, mainly useful in node to specify in the [wrtc](https://npmjs.com/package/wrtc) package. Contains an object with the properties:
+- `wrtc` - custom webrtc implementation. Automatically detected in Node.js (uses node-datachannel if available). Can be manually specified to use alternative implementations like [wrtc](https://npmjs.com/package/wrtc). Contains an object with the properties:
   - [`RTCPeerConnection`](https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection)
   - [`RTCSessionDescription`](https://www.w3.org/TR/webrtc/#dom-rtcsessiondescription)
   - [`RTCIceCandidate`](https://www.w3.org/TR/webrtc/#dom-rtcicecandidate)
-
 - `objectMode` - set to `true` to create the stream in [Object Mode](https://nodejs.org/api/stream.html#stream_object_mode). In this mode, incoming string data is not automatically converted to `Buffer` objects.
 
 ### `peer.signal(data)`
@@ -329,30 +270,6 @@ Send text/binary data to the remote peer. `data` can be any of several types: `S
 etc.), `ArrayBuffer`, or `Blob` (in browsers that support it).
 
 Note: If this method is called before the `peer.on('connect')` event has fired, then an exception will be thrown. Use `peer.write(data)` (which is inherited from the node.js [duplex stream](http://nodejs.org/api/stream.html) interface) if you want this data to be buffered instead.
-
-### `peer.addStream(stream)`
-
-Add a `MediaStream` to the connection.
-
-### `peer.removeStream(stream)`
-
-Remove a `MediaStream` from the connection.
-
-### `peer.addTrack(track, stream)`
-
-Add a `MediaStreamTrack` to the connection. Must also pass the `MediaStream` you want to attach it to.
-
-### `peer.removeTrack(track, stream)`
-
-Remove a `MediaStreamTrack` from the connection. Must also pass the `MediaStream` that it was attached to.
-
-### `peer.replaceTrack(oldTrack, newTrack, stream)`
-
-Replace a `MediaStreamTrack` with another track. Must also pass the `MediaStream` that the old track was attached to.
-
-### `peer.addTransceiver(kind, init)`
-
-Add a `RTCRtpTransceiver` to the connection. Can be used to add transceivers before adding tracks. Automatically called as neccesary by `addTrack`.
 
 ### `peer.destroy([err])`
 
@@ -421,26 +338,6 @@ Fired when the peer connection and data channel are ready to use.
 Received a message from the remote peer (via the data channel).
 
 `data` will be either a `String` or a `Buffer/Uint8Array` (see [buffer](https://github.com/feross/buffer)).
-
-### `peer.on('stream', stream => {})`
-
-Received a remote video stream, which can be displayed in a video tag:
-
-```js
-peer.on('stream', stream => {
-  var video = document.querySelector('video')
-  if ('srcObject' in video) {
-    video.srcObject = stream
-  } else {
-    video.src = window.URL.createObjectURL(stream)
-  }
-  video.play()
-})
-```
-
-### `peer.on('track', (track, stream) => {})`
-
-Received a remote audio/video track. Streams may contain multiple tracks.
 
 ### `peer.on('close', () => {})`
 

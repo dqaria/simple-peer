@@ -1,6 +1,6 @@
 {
   "name": "simple-peer",
-  "description": "Simple one-to-one WebRTC video/voice and data channels",
+  "description": "Simple WebRTC data channels for Node.js and browsers",
   "version": "9.11.1",
   "author": {
     "name": "Feross Aboukhadijeh",
@@ -19,6 +19,9 @@
     "randombytes": "^2.1.0",
     "readable-stream": "^3.6.0"
   },
+  "optionalDependencies": {
+    "node-datachannel": "^0.12.0"
+  },
   "devDependencies": {
     "airtap": "^4.0.3",
     "airtap-manual": "^1.0.0",
@@ -35,7 +38,6 @@
     "string-to-stream": "^3.0.1",
     "tape": "^5.5.2",
     "thunky": "^1.1.0",
-    "wrtc": "^0.4.7",
     "ws": "^7.5.3"
   },
   "keywords": [
@@ -45,13 +47,11 @@
     "data channels",
     "p2p",
     "peer",
-    "peer",
     "peer-to-peer",
     "stream",
-    "video",
-    "voice",
     "webrtc",
-    "webrtc stream"
+    "webrtc datachannel",
+    "node-datachannel"
   ],
   "license": "MIT",
   "main": "index.js",

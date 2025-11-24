@@ -1,6 +1,7 @@
 /*! simple-peer. MIT License. Feross Aboukhadijeh <https://feross.org/opensource> */
 const debug = require('debug')('simple-peer')
 const getBrowserRTC = require('get-browser-rtc')
+const getNodeDataChannelRTC = require('./node-datachannel-adapter')
 const randombytes = require('randombytes')
 const stream = require('readable-stream')
 const queueMicrotask = require('queue-microtask') // TODO: remove when Node 10 is not supported
@@ -47,7 +48,6 @@ class Peer extends stream.Duplex {
     this.offerOptions = opts.offerOptions || {}
     this.answerOptions = opts.answerOptions || {}
     this.sdpTransform = opts.sdpTransform || (sdp => sdp)
-    this.streams = opts.streams || (opts.stream ? [opts.stream] : []) // support old "stream" option
     this.trickle = opts.trickle !== undefined ? opts.trickle : true
     this.allowHalfTrickle = opts.allowHalfTrickle !== undefined ? opts.allowHalfTrickle : false
     this.iceCompleteTimeout = opts.iceCompleteTimeout || ICECOMPLETE_TIMEOUT
@@ -63,13 +63,22 @@ class Peer extends stream.Duplex {
     this.localFamily = undefined
     this.localPort = undefined
 
-    this._wrtc = (opts.wrtc && typeof opts.wrtc === 'object')
-      ? opts.wrtc
-      : getBrowserRTC()
+    // Determine WebRTC implementation to use
+    // Priority: opts.wrtc > node-datachannel (Node.js only) > browser native
+    this._wrtc = null
+    if (opts.wrtc && typeof opts.wrtc === 'object') {
+      this._wrtc = opts.wrtc
+    } else if (typeof window === 'undefined') {
+      // Node.js environment - try node-datachannel first
+      this._wrtc = getNodeDataChannelRTC()
+    } else {
+      // Browser environment
+      this._wrtc = getBrowserRTC()
+    }
 
     if (!this._wrtc) {
       if (typeof window === 'undefined') {
-        throw errCode(new Error('No WebRTC support: Specify `opts.wrtc` option in this environment'), 'ERR_WEBRTC_SUPPORT')
+        throw errCode(new Error('No WebRTC support: Install node-datachannel or specify `opts.wrtc` option in Node.js environment'), 'ERR_WEBRTC_SUPPORT')
       } else {
         throw errCode(new Error('No WebRTC support: Not a supported browser'), 'ERR_WEBRTC_SUPPORT')
       }
@@ -86,12 +95,7 @@ class Peer extends stream.Duplex {
     this._firstNegotiation = true
     this._batchedNegotiation = false // batch synchronous negotiations
     this._queuedNegotiation = false // is there a queued negotiation request?
-    this._sendersAwaitingStable = []
-    this._senderMap = new Map()
     this._closingInterval = null
-
-    this._remoteTracks = []
-    this._remoteStreams = []
 
     this._chunk = null
     this._cb = null
@@ -147,15 +151,6 @@ class Peer extends stream.Duplex {
       }
     }
 
-    if (this.streams) {
-      this.streams.forEach(stream => {
-        this.addStream(stream)
-      })
-    }
-    this._pc.ontrack = event => {
-      this._onTrack(event)
-    }
-
     this._debug('initial negotiation')
     this._needsNegotiation()
 
@@ -195,10 +190,6 @@ class Peer extends stream.Duplex {
       this._debug('got request to renegotiate')
       this._needsNegotiation()
     }
-    if (data.transceiverRequest && this.initiator) {
-      this._debug('got request for transceiver')
-      this.addTransceiver(data.transceiverRequest.kind, data.transceiverRequest.init)
-    }
     if (data.candidate) {
       if (this._pc.remoteDescription && this._pc.remoteDescription.type) {
         this._addIceCandidate(data.candidate)
@@ -222,7 +213,7 @@ class Peer extends stream.Duplex {
           this.destroy(errCode(err, 'ERR_SET_REMOTE_DESCRIPTION'))
         })
     }
-    if (!data.sdp && !data.candidate && !data.renegotiate && !data.transceiverRequest) {
+    if (!data.sdp && !data.candidate && !data.renegotiate) {
       this.destroy(errCode(new Error('signal() called with invalid signal data'), 'ERR_SIGNALING'))
     }
   }
@@ -247,136 +238,6 @@ class Peer extends stream.Duplex {
     if (this.destroying) return
     if (this.destroyed) throw errCode(new Error('cannot send after peer is destroyed'), 'ERR_DESTROYED')
     this._channel.send(chunk)
-  }
-
-  /**
-   * Add a Transceiver to the connection.
-   * @param {String} kind
-   * @param {Object} init
-   */
-  addTransceiver (kind, init) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot addTransceiver after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('addTransceiver()')
-
-    if (this.initiator) {
-      try {
-        this._pc.addTransceiver(kind, init)
-        this._needsNegotiation()
-      } catch (err) {
-        this.destroy(errCode(err, 'ERR_ADD_TRANSCEIVER'))
-      }
-    } else {
-      this.emit('signal', { // request initiator to renegotiate
-        type: 'transceiverRequest',
-        transceiverRequest: { kind, init }
-      })
-    }
-  }
-
-  /**
-   * Add a MediaStream to the connection.
-   * @param {MediaStream} stream
-   */
-  addStream (stream) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot addStream after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('addStream()')
-
-    stream.getTracks().forEach(track => {
-      this.addTrack(track, stream)
-    })
-  }
-
-  /**
-   * Add a MediaStreamTrack to the connection.
-   * @param {MediaStreamTrack} track
-   * @param {MediaStream} stream
-   */
-  addTrack (track, stream) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot addTrack after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('addTrack()')
-
-    const submap = this._senderMap.get(track) || new Map() // nested Maps map [track, stream] to sender
-    let sender = submap.get(stream)
-    if (!sender) {
-      sender = this._pc.addTrack(track, stream)
-      submap.set(stream, sender)
-      this._senderMap.set(track, submap)
-      this._needsNegotiation()
-    } else if (sender.removed) {
-      throw errCode(new Error('Track has been removed. You should enable/disable tracks that you want to re-add.'), 'ERR_SENDER_REMOVED')
-    } else {
-      throw errCode(new Error('Track has already been added to that stream.'), 'ERR_SENDER_ALREADY_ADDED')
-    }
-  }
-
-  /**
-   * Replace a MediaStreamTrack by another in the connection.
-   * @param {MediaStreamTrack} oldTrack
-   * @param {MediaStreamTrack} newTrack
-   * @param {MediaStream} stream
-   */
-  replaceTrack (oldTrack, newTrack, stream) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot replaceTrack after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('replaceTrack()')
-
-    const submap = this._senderMap.get(oldTrack)
-    const sender = submap ? submap.get(stream) : null
-    if (!sender) {
-      throw errCode(new Error('Cannot replace track that was never added.'), 'ERR_TRACK_NOT_ADDED')
-    }
-    if (newTrack) this._senderMap.set(newTrack, submap)
-
-    if (sender.replaceTrack != null) {
-      sender.replaceTrack(newTrack)
-    } else {
-      this.destroy(errCode(new Error('replaceTrack is not supported in this browser'), 'ERR_UNSUPPORTED_REPLACETRACK'))
-    }
-  }
-
-  /**
-   * Remove a MediaStreamTrack from the connection.
-   * @param {MediaStreamTrack} track
-   * @param {MediaStream} stream
-   */
-  removeTrack (track, stream) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot removeTrack after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('removeSender()')
-
-    const submap = this._senderMap.get(track)
-    const sender = submap ? submap.get(stream) : null
-    if (!sender) {
-      throw errCode(new Error('Cannot remove track that was never added.'), 'ERR_TRACK_NOT_ADDED')
-    }
-    try {
-      sender.removed = true
-      this._pc.removeTrack(sender)
-    } catch (err) {
-      if (err.name === 'NS_ERROR_UNEXPECTED') {
-        this._sendersAwaitingStable.push(sender) // HACK: Firefox must wait until (signalingState === stable) https://bugzilla.mozilla.org/show_bug.cgi?id=1133874
-      } else {
-        this.destroy(errCode(err, 'ERR_REMOVE_TRACK'))
-      }
-    }
-    this._needsNegotiation()
-  }
-
-  /**
-   * Remove a MediaStream from the connection.
-   * @param {MediaStream} stream
-   */
-  removeStream (stream) {
-    if (this.destroying) return
-    if (this.destroyed) throw errCode(new Error('cannot removeStream after peer is destroyed'), 'ERR_DESTROYED')
-    this._debug('removeSenders()')
-
-    stream.getTracks().forEach(track => {
-      this.removeTrack(track, stream)
-    })
   }
 
   _needsNegotiation () {
@@ -451,9 +312,6 @@ class Peer extends stream.Duplex {
       this._connected = false
       this._pcReady = false
       this._channelReady = false
-      this._remoteTracks = null
-      this._remoteStreams = null
-      this._senderMap = null
 
       clearInterval(this._closingInterval)
       this._closingInterval = null
@@ -487,7 +345,6 @@ class Peer extends stream.Duplex {
         this._pc.onicegatheringstatechange = null
         this._pc.onsignalingstatechange = null
         this._pc.onicecandidate = null
-        this._pc.ontrack = null
         this._pc.ondatachannel = null
       }
       this._pc = null
@@ -643,17 +500,6 @@ class Peer extends stream.Duplex {
       })
   }
 
-  _requestMissingTransceivers () {
-    if (this._pc.getTransceivers) {
-      this._pc.getTransceivers().forEach(transceiver => {
-        if (!transceiver.mid && transceiver.sender.track && !transceiver.requested) {
-          transceiver.requested = true // HACK: Safari returns negotiated transceivers with a null mid
-          this.addTransceiver(transceiver.sender.track.kind)
-        }
-      })
-    }
-  }
-
   _createAnswer () {
     if (this.destroyed) return
 
@@ -671,7 +517,6 @@ class Peer extends stream.Duplex {
             type: signal.type,
             sdp: signal.sdp
           })
-          if (!this.initiator) this._requestMissingTransceivers()
         }
 
         const onSuccess = () => {
@@ -926,14 +771,6 @@ class Peer extends stream.Duplex {
     if (this._pc.signalingState === 'stable') {
       this._isNegotiating = false
 
-      // HACK: Firefox doesn't yet support removing tracks when signalingState !== 'stable'
-      this._debug('flushing sender queue', this._sendersAwaitingStable)
-      this._sendersAwaitingStable.forEach(sender => {
-        this._pc.removeTrack(sender)
-        this._queuedNegotiation = true
-      })
-      this._sendersAwaitingStable = []
-
       if (this._queuedNegotiation) {
         this._debug('flushing negotiation queue')
         this._queuedNegotiation = false
@@ -995,30 +832,6 @@ class Peer extends stream.Duplex {
     if (this.destroyed) return
     this._debug('on channel close')
     this.destroy()
-  }
-
-  _onTrack (event) {
-    if (this.destroyed) return
-
-    event.streams.forEach(eventStream => {
-      this._debug('on track')
-      this.emit('track', event.track, eventStream)
-
-      this._remoteTracks.push({
-        track: event.track,
-        stream: eventStream
-      })
-
-      if (this._remoteStreams.some(remoteStream => {
-        return remoteStream.id === eventStream.id
-      })) return // Only fire one 'stream' event, even though there may be multiple tracks per stream
-
-      this._remoteStreams.push(eventStream)
-      queueMicrotask(() => {
-        this._debug('on stream')
-        this.emit('stream', eventStream) // ensure all tracks have been added
-      })
-    })
   }
 
   _debug () {
