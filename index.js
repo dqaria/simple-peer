@@ -10,7 +10,6 @@ const { Buffer } = require('buffer')
 
 const MAX_BUFFERED_AMOUNT = 64 * 1024
 const ICECOMPLETE_TIMEOUT = 5 * 1000
-const CHANNEL_CLOSING_TIMEOUT = 5 * 1000
 
 // HACK: Filter trickle lines when trickle is disabled #354
 function filterTrickle (sdp) {
@@ -56,13 +55,6 @@ class Peer extends stream.Duplex {
     this.destroying = false
     this._connected = false
 
-    this.remoteAddress = undefined
-    this.remoteFamily = undefined
-    this.remotePort = undefined
-    this.localAddress = undefined
-    this.localFamily = undefined
-    this.localPort = undefined
-
     // Determine WebRTC implementation to use
     // Priority: opts.wrtc > node-datachannel (Node.js only) > browser native
     this._wrtc = null
@@ -95,7 +87,6 @@ class Peer extends stream.Duplex {
     this._firstNegotiation = true
     this._batchedNegotiation = false // batch synchronous negotiations
     this._queuedNegotiation = false // is there a queued negotiation request?
-    this._closingInterval = null
 
     this._chunk = null
     this._cb = null
@@ -107,10 +98,6 @@ class Peer extends stream.Duplex {
       this.destroy(errCode(err, 'ERR_PC_CONSTRUCTOR'))
       return
     }
-
-    // We prefer feature detection whenever possible, but sometimes that's not
-    // possible for certain implementations.
-    this._isReactNativeWebrtc = typeof this._pc._peerConnectionId === 'number'
 
     this._pc.oniceconnectionstatechange = () => {
       this._onIceStateChange()
@@ -126,13 +113,6 @@ class Peer extends stream.Duplex {
     }
     this._pc.onicecandidate = event => {
       this._onIceCandidate(event)
-    }
-
-    // HACK: Fix for odd Firefox behavior, see: https://github.com/feross/simple-peer/pull/783
-    if (typeof this._pc.peerIdentity === 'object') {
-      this._pc.peerIdentity.catch(err => {
-        this.destroy(errCode(err, 'ERR_PC_PEER_IDENTITY'))
-      })
     }
 
     // Other spec events, unused by this implementation:
@@ -164,14 +144,8 @@ class Peer extends stream.Duplex {
     return (this._channel && this._channel.bufferedAmount) || 0
   }
 
-  // HACK: it's possible channel.readyState is "closing" before peer.destroy() fires
-  // https://bugs.chromium.org/p/chromium/issues/detail?id=882743
   get connected () {
-    return (this._connected && this._channel.readyState === 'open')
-  }
-
-  address () {
-    return { port: this.localPort, family: this.localFamily, address: this.localAddress }
+    return this._connected
   }
 
   signal (data) {
@@ -313,9 +287,6 @@ class Peer extends stream.Duplex {
       this._pcReady = false
       this._channelReady = false
 
-      clearInterval(this._closingInterval)
-      this._closingInterval = null
-
       clearInterval(this._interval)
       this._interval = null
       this._chunk = null
@@ -391,18 +362,6 @@ class Peer extends stream.Duplex {
         : new Error(`Datachannel error: ${event.message} ${event.filename}:${event.lineno}:${event.colno}`)
       this.destroy(errCode(err, 'ERR_DATA_CHANNEL'))
     }
-
-    // HACK: Chrome will sometimes get stuck in readyState "closing", let's check for this condition
-    // https://bugs.chromium.org/p/chromium/issues/detail?id=882743
-    let isClosing = false
-    this._closingInterval = setInterval(() => { // No "onclosing" event
-      if (this._channel && this._channel.readyState === 'closing') {
-        if (isClosing) this._onChannelClose() // closing timed out: equivalent to onclose firing
-        isClosing = true
-      } else {
-        isClosing = false
-      }
-    }, CHANNEL_CLOSING_TIMEOUT)
   }
 
   _read () {}
@@ -569,193 +528,36 @@ class Peer extends stream.Duplex {
     }
   }
 
-  getStats (cb) {
-    // statreports can come with a value array instead of properties
-    const flattenValues = report => {
-      if (Object.prototype.toString.call(report.values) === '[object Array]') {
-        report.values.forEach(value => {
-          Object.assign(report, value)
-        })
-      }
-      return report
-    }
-
-    // Promise-based getStats() (standard)
-    if (this._pc.getStats.length === 0 || this._isReactNativeWebrtc) {
-      this._pc.getStats()
-        .then(res => {
-          const reports = []
-          res.forEach(report => {
-            reports.push(flattenValues(report))
-          })
-          cb(null, reports)
-        }, err => cb(err))
-
-    // Single-parameter callback-based getStats() (non-standard)
-    } else if (this._pc.getStats.length > 0) {
-      this._pc.getStats(res => {
-        // If we destroy connection in `connect` callback this code might happen to run when actual connection is already closed
-        if (this.destroyed) return
-
-        const reports = []
-        res.result().forEach(result => {
-          const report = {}
-          result.names().forEach(name => {
-            report[name] = result.stat(name)
-          })
-          report.id = result.id
-          report.type = result.type
-          report.timestamp = result.timestamp
-          reports.push(flattenValues(report))
-        })
-        cb(null, reports)
-      }, err => cb(err))
-
-    // Unknown browser, skip getStats() since it's anyone's guess which style of
-    // getStats() they implement.
-    } else {
-      cb(null, [])
-    }
-  }
-
   _maybeReady () {
     this._debug('maybeReady pc %s channel %s', this._pcReady, this._channelReady)
     if (this._connected || this._connecting || !this._pcReady || !this._channelReady) return
 
     this._connecting = true
+    this._connected = true
 
-    // HACK: We can't rely on order here, for details see https://github.com/js-platform/node-webrtc/issues/339
-    const findCandidatePair = () => {
-      if (this.destroyed) return
+    if (this._chunk) {
+      try {
+        this.send(this._chunk)
+      } catch (err) {
+        return this.destroy(errCode(err, 'ERR_DATA_CHANNEL'))
+      }
+      this._chunk = null
+      this._debug('sent chunk from "write before connect"')
 
-      this.getStats((err, items) => {
-        if (this.destroyed) return
-
-        // Treat getStats error as non-fatal. It's not essential.
-        if (err) items = []
-
-        const remoteCandidates = {}
-        const localCandidates = {}
-        const candidatePairs = {}
-        let foundSelectedCandidatePair = false
-
-        items.forEach(item => {
-          // TODO: Once all browsers support the hyphenated stats report types, remove
-          // the non-hypenated ones
-          if (item.type === 'remotecandidate' || item.type === 'remote-candidate') {
-            remoteCandidates[item.id] = item
-          }
-          if (item.type === 'localcandidate' || item.type === 'local-candidate') {
-            localCandidates[item.id] = item
-          }
-          if (item.type === 'candidatepair' || item.type === 'candidate-pair') {
-            candidatePairs[item.id] = item
-          }
-        })
-
-        const setSelectedCandidatePair = selectedCandidatePair => {
-          foundSelectedCandidatePair = true
-
-          let local = localCandidates[selectedCandidatePair.localCandidateId]
-
-          if (local && (local.ip || local.address)) {
-            // Spec
-            this.localAddress = local.ip || local.address
-            this.localPort = Number(local.port)
-          } else if (local && local.ipAddress) {
-            // Firefox
-            this.localAddress = local.ipAddress
-            this.localPort = Number(local.portNumber)
-          } else if (typeof selectedCandidatePair.googLocalAddress === 'string') {
-            // TODO: remove this once Chrome 58 is released
-            local = selectedCandidatePair.googLocalAddress.split(':')
-            this.localAddress = local[0]
-            this.localPort = Number(local[1])
-          }
-          if (this.localAddress) {
-            this.localFamily = this.localAddress.includes(':') ? 'IPv6' : 'IPv4'
-          }
-
-          let remote = remoteCandidates[selectedCandidatePair.remoteCandidateId]
-
-          if (remote && (remote.ip || remote.address)) {
-            // Spec
-            this.remoteAddress = remote.ip || remote.address
-            this.remotePort = Number(remote.port)
-          } else if (remote && remote.ipAddress) {
-            // Firefox
-            this.remoteAddress = remote.ipAddress
-            this.remotePort = Number(remote.portNumber)
-          } else if (typeof selectedCandidatePair.googRemoteAddress === 'string') {
-            // TODO: remove this once Chrome 58 is released
-            remote = selectedCandidatePair.googRemoteAddress.split(':')
-            this.remoteAddress = remote[0]
-            this.remotePort = Number(remote[1])
-          }
-          if (this.remoteAddress) {
-            this.remoteFamily = this.remoteAddress.includes(':') ? 'IPv6' : 'IPv4'
-          }
-
-          this._debug(
-            'connect local: %s:%s remote: %s:%s',
-            this.localAddress,
-            this.localPort,
-            this.remoteAddress,
-            this.remotePort
-          )
-        }
-
-        items.forEach(item => {
-          // Spec-compliant
-          if (item.type === 'transport' && item.selectedCandidatePairId) {
-            setSelectedCandidatePair(candidatePairs[item.selectedCandidatePairId])
-          }
-
-          // Old implementations
-          if (
-            (item.type === 'googCandidatePair' && item.googActiveConnection === 'true') ||
-            ((item.type === 'candidatepair' || item.type === 'candidate-pair') && item.selected)
-          ) {
-            setSelectedCandidatePair(item)
-          }
-        })
-
-        // Ignore candidate pair selection in browsers like Safari 11 that do not have any local or remote candidates
-        // But wait until at least 1 candidate pair is available
-        if (!foundSelectedCandidatePair && (!Object.keys(candidatePairs).length || Object.keys(localCandidates).length)) {
-          setTimeout(findCandidatePair, 100)
-          return
-        } else {
-          this._connecting = false
-          this._connected = true
-        }
-
-        if (this._chunk) {
-          try {
-            this.send(this._chunk)
-          } catch (err) {
-            return this.destroy(errCode(err, 'ERR_DATA_CHANNEL'))
-          }
-          this._chunk = null
-          this._debug('sent chunk from "write before connect"')
-
-          const cb = this._cb
-          this._cb = null
-          cb(null)
-        }
-
-        // If `bufferedAmountLowThreshold` and 'onbufferedamountlow' are unsupported,
-        // fallback to using setInterval to implement backpressure.
-        if (typeof this._channel.bufferedAmountLowThreshold !== 'number') {
-          this._interval = setInterval(() => this._onInterval(), 150)
-          if (this._interval.unref) this._interval.unref()
-        }
-
-        this._debug('connect')
-        this.emit('connect')
-      })
+      const cb = this._cb
+      this._cb = null
+      cb(null)
     }
-    findCandidatePair()
+
+    // If `bufferedAmountLowThreshold` and 'onbufferedamountlow' are unsupported,
+    // fallback to using setInterval to implement backpressure.
+    if (typeof this._channel.bufferedAmountLowThreshold !== 'number') {
+      this._interval = setInterval(() => this._onInterval(), 150)
+      if (this._interval.unref) this._interval.unref()
+    }
+
+    this._debug('connect')
+    this.emit('connect')
   }
 
   _onInterval () {
